@@ -21,9 +21,18 @@ class Hero:
         return False
     
     def cast(self, ability, target):
+        if self.mana < ability.mana_cost:
+            print(
+                f"{datetime.now()} - Mana insuficiente para usar {ability.name}"
+            )
+            return
+
+        self.mana -= ability.mana_cost
         command = f"dota_execute {self.name} {ability.name} {target.name}"
         os.system(command)
-        print(f"{datetime.now()} - {self.name} usou {ability.name} em {target.name}")
+        print(
+            f"{datetime.now()} - {self.name} usou {ability.name} em {target.name}"
+        )
 
 class Ability:
     def __init__(self, name, mana_cost, damage):
