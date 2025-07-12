@@ -1,0 +1,1021 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Dota 2 Fog Detector - Detector de Wards e Itens para Dota 2
+Versão melhorada com estrutura orientada a objetos, melhor tratamento de erros,
+otimização de desempenho e interface gráfica aprimorada com minimapa.
+"""
+
+import cv2
+import numpy as np
+import tkinter as tk
+from tkinter import ttk, font
+from datetime import datetime, timedelta
+import pygetwindow as gw
+import mss
+import os
+import json
+import logging
+import threading
+import time
+from typing import Optional, List, Dict, Any, Tuple, Union
+from pathlib import Path
+import sys
+from PIL import Image, ImageTk
+
+# Configuração de logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("fog_detector.log", mode='a')
+    ]
+)
+logger = logging.getLogger("FogDetector")
+
+
+class ConfigManager:
+    """Gerencia as configurações do aplicativo com suporte a arquivo de configuração."""
+    
+    DEFAULT_CONFIG = {
+        "tesseract_path": r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+        "weights_path": r"C:\Users\wesle\Desktop\Bot\yolov3.weights",
+        "cfg_path": r"C:\Users\wesle\Desktop\Bot\yolov3.cfg",
+        "names_path": r"C:\Users\wesle\Desktop\Bot\classes.names",
+        "dota_window_title": "Dota 2",
+        "confidence_threshold": 0.5,
+        "detection_interval_ms": 1500,
+        "overlay_update_interval_ms": 500,
+        "duplicate_threshold_seconds": 2.0,
+        "item_durations": {
+            "Observer Ward": 360,
+            "Sentry Ward": 420,
+            "Smoke of Deceit": 0
+        },
+        "overlay": {
+            "width": 450,
+            "height": 300,
+            "position_x": 100,
+            "position_y": 100,
+            "opacity": 0.75,
+            "font_size": 12,
+            "font_family": "Consolas",
+            "text_color": "#FFFFFF",
+            "background_color": "#000000"
+        },
+        "minimap": {
+            "enabled": True,
+            "width": 200,
+            "height": 200,
+            "position": "right",  # "right", "left", "top", "bottom"
+            "image_path": "dota_resources/dota_minimap.jpeg",
+            "observer_ward_color": "#00FF00",  # Verde
+            "sentry_ward_color": "#FF00FF",    # Magenta
+            "marker_size": 5,
+            "show_timer": True
+        },
+        "debug_mode": False
+    }
+    
+    def __init__(self, config_file: str = "fog_detector_config.json"):
+        """Inicializa o gerenciador de configurações."""
+        self.config_file = config_file
+        self.config = self._load_config()
+        
+    def _load_config(self) -> Dict[str, Any]:
+        """Carrega configurações do arquivo ou usa padrões."""
+        try:
+            if os.path.exists(self.config_file):
+                with open(self.config_file, 'r') as f:
+                    loaded_config = json.load(f)
+                    # Mesclar com configurações padrão para garantir que todos os campos existam
+                    config = self.DEFAULT_CONFIG.copy()
+                    self._deep_update(config, loaded_config)
+                    logger.info(f"Configurações carregadas de {self.config_file}")
+                    return config
+        except Exception as e:
+            logger.error(f"Erro ao carregar configurações: {e}")
+        
+        # Se falhar ou arquivo não existir, usar configurações padrão
+        logger.info("Usando configurações padrão")
+        return self.DEFAULT_CONFIG.copy()
+    
+    def _deep_update(self, d: Dict, u: Dict) -> None:
+        """Atualiza recursivamente um dicionário com outro."""
+        for k, v in u.items():
+            if isinstance(v, dict) and k in d and isinstance(d[k], dict):
+                self._deep_update(d[k], v)
+            else:
+                d[k] = v
+    
+    def save_config(self) -> bool:
+        """Salva as configurações atuais no arquivo."""
+        try:
+            with open(self.config_file, 'w') as f:
+                json.dump(self.config, f, indent=4)
+            logger.info(f"Configurações salvas em {self.config_file}")
+            return True
+        except Exception as e:
+            logger.error(f"Erro ao salvar configurações: {e}")
+            return False
+    
+    def get(self, key: str, default: Any = None) -> Any:
+        """Obtém um valor de configuração usando notação de ponto."""
+        keys = key.split('.')
+        value = self.config
+        try:
+            for k in keys:
+                value = value[k]
+            return value
+        except (KeyError, TypeError):
+            return default
+    
+    def set(self, key: str, value: Any) -> None:
+        """Define um valor de configuração usando notação de ponto."""
+        keys = key.split('.')
+        config = self.config
+        for k in keys[:-1]:
+            if k not in config or not isinstance(config[k], dict):
+                config[k] = {}
+            config = config[k]
+        config[keys[-1]] = value
+
+
+class YOLODetector:
+    """Implementa a detecção de objetos usando YOLO."""
+    
+    def __init__(self, config_manager: ConfigManager):
+        """Inicializa o detector YOLO com as configurações fornecidas."""
+        self.config = config_manager
+        self.classes = []
+        self.net = None
+        self.out_layers = []
+        self.initialized = False
+        self._initialize()
+    
+    def _initialize(self) -> None:
+        """Inicializa o modelo YOLO e carrega as classes."""
+        weights_path = self.config.get("weights_path")
+        cfg_path = self.config.get("cfg_path")
+        names_path = self.config.get("names_path")
+        
+        # Verificar se os arquivos existem
+        for path in [weights_path, cfg_path, names_path]:
+            if not os.path.exists(path):
+                logger.error(f"Arquivo não encontrado: {path}")
+                return
+        
+        # Carregar nomes das classes
+        try:
+            with open(names_path, "r") as f:
+                self.classes = [line.strip() for line in f.readlines()]
+            logger.info(f"Carregadas {len(self.classes)} classes de {names_path}")
+        except Exception as e:
+            logger.error(f"Erro ao carregar classes: {e}")
+            return
+        
+        # Carregar modelo YOLO
+        try:
+            self.net = cv2.dnn.readNet(weights_path, cfg_path)
+            
+            # Tentar usar aceleração de hardware se disponível
+            try:
+                # Verificar se CUDA está disponível
+                cv_build_info = cv2.getBuildInformation()
+                if "CUDA" in cv_build_info and "YES" in cv_build_info.split("CUDA")[1].split("\n")[0]:
+                    logger.info("Usando aceleração CUDA para detecção")
+                    self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+                    self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+            except Exception as e:
+                logger.warning(f"Não foi possível configurar aceleração de hardware: {e}")
+            
+            # Obter nomes das camadas de saída
+            layer_names = self.net.getLayerNames()
+            try:
+                # Ajuste para compatibilidade com diferentes versões do OpenCV
+                unconnected_layers_indices = self.net.getUnconnectedOutLayers()
+                if isinstance(unconnected_layers_indices[0], (list, np.ndarray)):
+                    self.out_layers = [layer_names[i[0] - 1] for i in unconnected_layers_indices]
+                else:
+                    self.out_layers = [layer_names[i - 1] for i in unconnected_layers_indices]
+                
+                self.initialized = True
+                logger.info("Detector YOLO inicializado com sucesso")
+            except IndexError as e:
+                logger.error(f"Erro ao obter camadas de saída: {e}")
+        except cv2.error as e:
+            logger.error(f"Erro ao carregar modelo YOLO: {e}")
+    
+    def detect(self, frame: np.ndarray) -> List[Dict[str, Any]]:
+        """
+        Detecta objetos no frame fornecido.
+        
+        Args:
+            frame: Imagem no formato numpy array (BGR)
+            
+        Returns:
+            Lista de detecções, cada uma com nome da classe, confiança e coordenadas
+        """
+        if not self.initialized or frame is None:
+            return []
+        
+        height, width, _ = frame.shape
+        confidence_threshold = self.config.get("confidence_threshold", 0.5)
+        
+        # Preparar imagem para a rede neural
+        blob = cv2.dnn.blobFromImage(frame, 1/255.0, (416, 416), swapRB=True, crop=False)
+        self.net.setInput(blob)
+        
+        try:
+            # Executar a detecção
+            outputs = self.net.forward(self.out_layers)
+        except cv2.error as e:
+            logger.error(f"Erro durante detecção: {e}")
+            return []
+        
+        detections = []
+        
+        # Processar as saídas da rede
+        for output in outputs:
+            for detection in output:
+                scores = detection[5:]
+                class_id = np.argmax(scores)
+                confidence = scores[class_id]
+                
+                if confidence > confidence_threshold and class_id < len(self.classes):
+                    item_name = self.classes[class_id]
+                    
+                    # Obter coordenadas do objeto
+                    center_x = int(detection[0] * width)
+                    center_y = int(detection[1] * height)
+                    w_box = int(detection[2] * width)
+                    h_box = int(detection[3] * height)
+                    
+                    # Calcular coordenadas do retângulo
+                    x = int(center_x - w_box / 2)
+                    y = int(center_y - h_box / 2)
+                    
+                    detections.append({
+                        'name': item_name,
+                        'confidence': float(confidence),
+                        'center_x': center_x,
+                        'center_y': center_y,
+                        'width': w_box,
+                        'height': h_box,
+                        'x': x,
+                        'y': y
+                    })
+        
+        return detections
+
+
+class ScreenCapture:
+    """Gerencia a captura de tela da janela do jogo."""
+    
+    def __init__(self, config_manager: ConfigManager):
+        """Inicializa o capturador de tela."""
+        self.config = config_manager
+        self.window_title = self.config.get("dota_window_title", "Dota 2")
+        self.sct = mss.mss()  # Inicializar o objeto mss uma vez
+    
+    def capture(self) -> Optional[Tuple[np.ndarray, int, int, int, int]]:
+        """
+        Captura a tela da janela do jogo.
+        
+        Returns:
+            Tupla com (frame, x, y, largura, altura) ou None se falhar
+        """
+        try:
+            dota_windows = gw.getWindowsWithTitle(self.window_title)
+            if not dota_windows:
+                return None
+            
+            dota_window = dota_windows[0]
+            
+            # Verificar se a janela está visível e tem tamanho válido
+            if (not dota_window.isVisible or dota_window.isMinimized or 
+                dota_window.width <= 0 or dota_window.height <= 0):
+                return None
+            
+            # Definir a região de captura
+            monitor = {
+                "top": dota_window.top,
+                "left": dota_window.left,
+                "width": dota_window.width,
+                "height": dota_window.height,
+            }
+            
+            # Capturar a tela
+            sct_img = self.sct.grab(monitor)
+            
+            # Converter para formato OpenCV (BGR)
+            img = np.array(sct_img)
+            img_bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+            
+            return img_bgr, dota_window.left, dota_window.top, dota_window.width, dota_window.height
+            
+        except Exception as e:
+            logger.error(f"Erro durante captura de tela: {e}")
+            return None
+    
+    def __del__(self):
+        """Libera recursos ao destruir o objeto."""
+        try:
+            self.sct.close()
+        except:
+            pass
+
+
+class MapRegionAnalyzer:
+    """Analisa a região do mapa com base nas coordenadas da tela."""
+    
+    def determine_region(self, x: int, y: int, width: int, height: int) -> str:
+        """
+        Determina uma região aproximada do mapa com base nas coordenadas da tela.
+        
+        Args:
+            x: Coordenada X na tela
+            y: Coordenada Y na tela
+            width: Largura total da tela
+            height: Altura total da tela
+            
+        Returns:
+            Nome da região do mapa
+        """
+        if width == 0 or height == 0:
+            return "Região Desconhecida"
+        
+        nx, ny = x / width, y / height
+        
+        # Mapa de regiões baseado em coordenadas normalizadas
+        if ny < 0.33:
+            if nx < 0.33: return "Top Lane (Radiant)"
+            elif nx < 0.66: return "Top Jungle (Radiant/Mid)"
+            else: return "Top Lane/Jungle (Dire)"
+        elif ny < 0.66:
+            if nx < 0.15: return "Jungle (Radiant)"
+            elif nx < 0.33: return "Mid Lane (Radiant Side)"
+            elif nx < 0.66: return "Mid Lane (Centro)"
+            elif nx < 0.85: return "Mid Lane (Dire Side)"
+            else: return "Jungle (Dire)"
+        else:
+            if nx < 0.33: return "Bot Lane/Jungle (Radiant)"
+            elif nx < 0.66: return "Bot Jungle (Dire/Mid)"
+            else: return "Bot Lane (Dire)"
+        
+        return "Região Indefinida"
+    
+    def screen_to_minimap(self, x: int, y: int, screen_width: int, screen_height: int, 
+                         minimap_width: int, minimap_height: int) -> Tuple[int, int]:
+        """
+        Converte coordenadas da tela para coordenadas do minimapa.
+        
+        Args:
+            x: Coordenada X na tela
+            y: Coordenada Y na tela
+            screen_width: Largura da tela do jogo
+            screen_height: Altura da tela do jogo
+            minimap_width: Largura do minimapa
+            minimap_height: Altura do minimapa
+            
+        Returns:
+            Tupla (x, y) com coordenadas no minimapa
+        """
+        # Normalizar coordenadas da tela (0.0 a 1.0)
+        nx = x / screen_width
+        ny = y / screen_height
+        
+        # O mapa do Dota 2 não é perfeitamente quadrado, então ajustamos ligeiramente
+        # Estes valores podem precisar de calibração fina
+        map_offset_x = 0.05  # 5% de offset horizontal
+        map_offset_y = 0.05  # 5% de offset vertical
+        map_scale_x = 0.9    # 90% da largura é usada
+        map_scale_y = 0.9    # 90% da altura é usada
+        
+        # Ajustar para o formato do mapa e converter para coordenadas do minimapa
+        minimap_x = int((nx * map_scale_x + map_offset_x) * minimap_width)
+        minimap_y = int((ny * map_scale_y + map_offset_y) * minimap_height)
+        
+        # Garantir que as coordenadas estejam dentro dos limites do minimapa
+        minimap_x = max(0, min(minimap_x, minimap_width - 1))
+        minimap_y = max(0, min(minimap_y, minimap_height - 1))
+        
+        return minimap_x, minimap_y
+
+
+class ItemTracker:
+    """Gerencia o rastreamento de itens detectados."""
+    
+    def __init__(self, config_manager: ConfigManager):
+        """Inicializa o rastreador de itens."""
+        self.config = config_manager
+        self.tracked_items = []
+        self.region_analyzer = MapRegionAnalyzer()
+        self.item_durations = self.config.get("item_durations", {})
+        self.duplicate_threshold = self.config.get("duplicate_threshold_seconds", 2.0)
+    
+    def process_detections(self, detections: List[Dict[str, Any]], frame_size: Tuple[int, int]) -> List[Dict[str, Any]]:
+        """
+        Processa as detecções e atualiza a lista de itens rastreados.
+        
+        Args:
+            detections: Lista de detecções do detector YOLO
+            frame_size: Tupla (largura, altura) do frame
+            
+        Returns:
+            Lista de novos itens adicionados ao rastreamento
+        """
+        width, height = frame_size
+        current_time = datetime.now()
+        new_items = []
+        
+        for detection in detections:
+            item_name = detection['name']
+            
+            # Verificar se o item está na lista de itens rastreáveis
+            if item_name not in self.item_durations:
+                continue
+            
+            # Determinar a região do mapa
+            region = self.region_analyzer.determine_region(
+                detection['center_x'], detection['center_y'], width, height
+            )
+            
+            # Verificar se é uma duplicata
+            is_duplicate = False
+            for item in self.tracked_items:
+                time_diff = (current_time - item['added_time']).total_seconds()
+                if (item['name'] == item_name and 
+                    item['region'] == region and 
+                    abs(time_diff) < self.duplicate_threshold):
+                    is_duplicate = True
+                    break
+            
+            if not is_duplicate:
+                duration = self.item_durations[item_name]
+                
+                # Só adicionar itens com duração (wards)
+                if duration > 0:
+                    expiry_time = current_time + timedelta(seconds=duration)
+                    unique_id = f"{item_name}_{region}_{current_time.timestamp()}"
+                    
+                    new_item = {
+                        'id': unique_id,
+                        'name': item_name,
+                        'expiry': expiry_time,
+                        'region': region,
+                        'added_time': current_time,
+                        'confidence': detection['confidence'],
+                        'screen_x': detection['center_x'],
+                        'screen_y': detection['center_y']
+                    }
+                    
+                    self.tracked_items.append(new_item)
+                    new_items.append(new_item)
+                    
+                    logger.info(
+                        f"[{current_time.strftime('%H:%M:%S')}] {item_name} detectado em '{region}'. "
+                        f"Expira às {expiry_time.strftime('%H:%M:%S')}. "
+                        f"Confiança: {detection['confidence']:.2f}"
+                    )
+                else:
+                    # Para itens sem duração como Smoke, apenas registrar o evento
+                    logger.info(
+                        f"[{current_time.strftime('%H:%M:%S')}] {item_name} detectado em '{region}'. "
+                        f"Confiança: {detection['confidence']:.2f}"
+                    )
+        
+        return new_items
+    
+    def update_tracked_items(self) -> List[Dict[str, Any]]:
+        """
+        Atualiza a lista de itens rastreados, removendo os expirados.
+        
+        Returns:
+            Lista de itens ativos (não expirados)
+        """
+        current_time = datetime.now()
+        active_items = []
+        
+        for item in self.tracked_items:
+            remaining_seconds = (item['expiry'] - current_time).total_seconds()
+            if remaining_seconds > 0:
+                active_items.append(item)
+        
+        self.tracked_items = active_items
+        return active_items
+    
+    def get_active_items(self) -> List[Dict[str, Any]]:
+        """
+        Retorna a lista de itens ativos ordenados por tempo restante.
+        
+        Returns:
+            Lista de itens ativos ordenados
+        """
+        active_items = self.update_tracked_items()
+        # Ordenar por tempo restante (do menor para o maior)
+        return sorted(active_items, key=lambda x: x['expiry'])
+
+
+class MinimapPanel:
+    """Painel de minimapa para visualização das wards detectadas."""
+    
+    def __init__(self, parent: tk.Frame, config_manager: ConfigManager, item_tracker: ItemTracker):
+        """
+        Inicializa o painel de minimapa.
+        
+        Args:
+            parent: Frame pai onde o painel será adicionado
+            config_manager: Gerenciador de configurações
+            item_tracker: Rastreador de itens
+        """
+        self.parent = parent
+        self.config = config_manager
+        self.item_tracker = item_tracker
+        self.region_analyzer = MapRegionAnalyzer()
+        
+        # Configurações do minimapa
+        self.minimap_config = self.config.get("minimap", {})
+        self.width = self.minimap_config.get("width", 200)
+        self.height = self.minimap_config.get("height", 200)
+        self.position = self.minimap_config.get("position", "right")
+        self.image_path = self.minimap_config.get("image_path", "dota_resources/dota_minimap.jpeg")
+        self.observer_color = self.minimap_config.get("observer_ward_color", "#00FF00")
+        self.sentry_color = self.minimap_config.get("sentry_ward_color", "#FF00FF")
+        self.marker_size = self.minimap_config.get("marker_size", 5)
+        self.show_timer = self.minimap_config.get("show_timer", True)
+        
+        # Criar frame para o minimapa
+        self.frame = tk.Frame(
+            parent,
+            width=self.width,
+            height=self.height,
+            bg=self.config.get("overlay.background_color", "#000000")
+        )
+        
+        # Posicionar o frame de acordo com a configuração
+        if self.position == "right":
+            self.frame.pack(side=tk.RIGHT, fill=tk.Y, padx=5, pady=5)
+        elif self.position == "left":
+            self.frame.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5)
+        elif self.position == "top":
+            self.frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=5)
+        elif self.position == "bottom":
+            self.frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=5)
+        
+        # Criar canvas para desenhar o minimapa
+        self.canvas = tk.Canvas(
+            self.frame,
+            width=self.width,
+            height=self.height,
+            bg=self.config.get("overlay.background_color", "#000000"),
+            highlightthickness=0
+        )
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+        
+        # Carregar imagem do minimapa
+        self.map_image = None
+        self.map_photo = None
+        self.load_map_image()
+    
+    def load_map_image(self) -> None:
+        """Carrega a imagem do minimapa."""
+        try:
+            # Verificar se o arquivo existe
+            if not os.path.exists(self.image_path):
+                logger.error(f"Imagem do minimapa não encontrada: {self.image_path}")
+                # Criar uma imagem em branco como fallback
+                self.map_image = Image.new('RGB', (self.width, self.height), color='black')
+            else:
+                # Carregar e redimensionar a imagem
+                self.map_image = Image.open(self.image_path)
+                self.map_image = self.map_image.resize((self.width, self.height), Image.LANCZOS)
+            
+            # Converter para formato PhotoImage do Tkinter
+            self.map_photo = ImageTk.PhotoImage(self.map_image)
+            
+            # Exibir a imagem no canvas
+            self.canvas.create_image(0, 0, anchor=tk.NW, image=self.map_photo, tags="map_image")
+            
+            logger.info(f"Imagem do minimapa carregada: {self.image_path}")
+        except Exception as e:
+            logger.error(f"Erro ao carregar imagem do minimapa: {e}")
+            # Criar uma imagem em branco como fallback
+            self.map_image = Image.new('RGB', (self.width, self.height), color='black')
+            self.map_photo = ImageTk.PhotoImage(self.map_image)
+            self.canvas.create_image(0, 0, anchor=tk.NW, image=self.map_photo, tags="map_image")
+    
+    def update_minimap(self, screen_width: int, screen_height: int) -> None:
+        """
+        Atualiza o minimapa com os itens rastreados.
+        
+        Args:
+            screen_width: Largura da tela do jogo
+            screen_height: Altura da tela do jogo
+        """
+        # Limpar marcadores anteriores
+        self.canvas.delete("ward_marker")
+        
+        # Obter itens ativos
+        active_items = self.item_tracker.get_active_items()
+        
+        for item in active_items:
+            # Converter coordenadas da tela para coordenadas do minimapa
+            minimap_x, minimap_y = self.region_analyzer.screen_to_minimap(
+                item['screen_x'], item['screen_y'], 
+                screen_width, screen_height,
+                self.width, self.height
+            )
+            
+            # Determinar cor do marcador
+            if item['name'] == "Observer Ward":
+                color = self.observer_color
+            elif item['name'] == "Sentry Ward":
+                color = self.sentry_color
+            else:
+                color = "#FFFFFF"  # Branco para outros itens
+            
+            # Calcular tempo restante
+            current_time = datetime.now()
+            remaining_seconds = (item['expiry'] - current_time).total_seconds()
+            minutes, seconds = divmod(int(remaining_seconds), 60)
+            
+            # Desenhar marcador
+            self.canvas.create_oval(
+                minimap_x - self.marker_size, minimap_y - self.marker_size,
+                minimap_x + self.marker_size, minimap_y + self.marker_size,
+                fill=color, outline="white", width=1,
+                tags="ward_marker"
+            )
+            
+            # Mostrar temporizador se configurado
+            if self.show_timer:
+                self.canvas.create_text(
+                    minimap_x, minimap_y + self.marker_size + 10,
+                    text=f"{minutes}:{seconds:02d}",
+                    fill="white", font=("Consolas", 8),
+                    tags="ward_marker"
+                )
+
+
+class OverlayGUI:
+    """Interface gráfica do overlay para exibir informações dos itens rastreados."""
+    
+    def __init__(self, config_manager: ConfigManager, item_tracker: ItemTracker):
+        """Inicializa a interface gráfica do overlay."""
+        self.config = config_manager
+        self.item_tracker = item_tracker
+        self.root = None
+        self.info_text = None
+        self.main_frame = None
+        self.minimap_panel = None
+        self.screen_width = 1920  # Valor padrão
+        self.screen_height = 1080  # Valor padrão
+        self._offset_x = 0
+        self._offset_y = 0
+        self._setup_gui()
+    
+    def _setup_gui(self) -> None:
+        """Configura a interface gráfica do overlay."""
+        # Configurações do overlay
+        overlay_config = self.config.get("overlay", {})
+        width = overlay_config.get("width", 450)
+        height = overlay_config.get("height", 300)
+        pos_x = overlay_config.get("position_x", 100)
+        pos_y = overlay_config.get("position_y", 100)
+        opacity = overlay_config.get("opacity", 0.75)
+        font_size = overlay_config.get("font_size", 12)
+        font_family = overlay_config.get("font_family", "Consolas")
+        text_color = overlay_config.get("text_color", "#FFFFFF")
+        bg_color = overlay_config.get("background_color", "#000000")
+        
+        # Criar janela principal
+        self.root = tk.Tk()
+        self.root.title("Dota 2 Item Tracker")
+        self.root.geometry(f"{width}x{height}+{pos_x}+{pos_y}")
+        
+        # Configurações da janela
+        self.root.attributes("-topmost", True)
+        self.root.attributes("-alpha", opacity)
+        self.root.overrideredirect(True)
+        self.root.configure(bg=bg_color)
+        
+        # Criar frame principal
+        self.main_frame = tk.Frame(self.root, bg=bg_color)
+        self.main_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Verificar se o minimapa está habilitado
+        if self.config.get("minimap.enabled", True):
+            # Criar painel de minimapa
+            self.minimap_panel = MinimapPanel(self.main_frame, self.config, self.item_tracker)
+        
+        # Criar frame para a lista de itens
+        self.items_frame = tk.Frame(self.main_frame, bg=bg_color)
+        self.items_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        
+        # Criar widget de texto
+        self.info_text = tk.Text(
+            self.items_frame,
+            font=(font_family, font_size),
+            fg=text_color,
+            bg=bg_color,
+            wrap=tk.WORD,
+            borderwidth=0,
+            highlightthickness=0
+        )
+        self.info_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+        
+        # Adicionar scrollbar
+        scrollbar = ttk.Scrollbar(self.items_frame, command=self.info_text.yview)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.info_text.config(yscrollcommand=scrollbar.set)
+        
+        # Configurar estilo da scrollbar
+        style = ttk.Style()
+        style.configure("TScrollbar", background=bg_color, troughcolor=bg_color, 
+                        arrowcolor=text_color, bordercolor=bg_color)
+        
+        # Adicionar funcionalidade de arrastar janela
+        self.main_frame.bind("<Button-1>", self._start_move)
+        self.main_frame.bind("<B1-Motion>", self._do_move)
+        self.info_text.bind("<Button-1>", self._start_move)
+        self.info_text.bind("<B1-Motion>", self._do_move)
+        
+        # Adicionar botão de fechar
+        close_button = tk.Label(
+            self.root, 
+            text="×", 
+            font=(font_family, font_size), 
+            fg=text_color, 
+            bg=bg_color,
+            cursor="hand2"
+        )
+        close_button.place(x=width-20, y=2)
+        close_button.bind("<Button-1>", lambda e: self.root.quit())
+        
+        # Adicionar botão de minimizar/maximizar
+        self.minimized = False
+        self.original_height = height
+        min_max_button = tk.Label(
+            self.root, 
+            text="_", 
+            font=(font_family, font_size), 
+            fg=text_color, 
+            bg=bg_color,
+            cursor="hand2"
+        )
+        min_max_button.place(x=width-40, y=2)
+        min_max_button.bind("<Button-1>", self._toggle_minimize)
+        
+        # Tentar tornar o fundo transparente
+        try:
+            self.root.attributes("-transparentcolor", bg_color)
+        except tk.TclError:
+            logger.warning("Transparência de cor não suportada neste sistema")
+    
+    def _start_move(self, event) -> None:
+        """Inicia o movimento da janela."""
+        self._offset_x = event.x
+        self._offset_y = event.y
+    
+    def _do_move(self, event) -> None:
+        """Realiza o movimento da janela."""
+        x = self.root.winfo_pointerx() - self._offset_x
+        y = self.root.winfo_pointery() - self._offset_y
+        self.root.geometry(f"+{x}+{y}")
+        
+        # Atualizar posição nas configurações
+        overlay_config = self.config.get("overlay", {})
+        overlay_config["position_x"] = x
+        overlay_config["position_y"] = y
+        self.config.set("overlay", overlay_config)
+    
+    def _toggle_minimize(self, event) -> None:
+        """Alterna entre minimizado e normal."""
+        if self.minimized:
+            self.root.geometry(f"{self.root.winfo_width()}x{self.original_height}")
+            self.minimized = False
+        else:
+            self.original_height = self.root.winfo_height()
+            self.root.geometry(f"{self.root.winfo_width()}x30")
+            self.minimized = True
+    
+    def update_display(self) -> None:
+        """Atualiza o display com os itens ativos."""
+        active_items = self.item_tracker.get_active_items()
+        current_time = datetime.now()
+        
+        # Limpar o conteúdo atual
+        self.info_text.configure(state=tk.NORMAL)
+        self.info_text.delete(1.0, tk.END)
+        
+        if active_items:
+            for item in active_items:
+                remaining_seconds = (item['expiry'] - current_time).total_seconds()
+                minutes, seconds = divmod(int(remaining_seconds), 60)
+                
+                # Formatar a mensagem
+                message = f"{item['name']} [{item['region']}]: {minutes}:{seconds:02d}\n"
+                
+                # Adicionar cor com base no tempo restante
+                if minutes < 1:  # Menos de 1 minuto
+                    self.info_text.insert(tk.END, message, "warning")
+                else:
+                    self.info_text.insert(tk.END, message, "normal")
+        else:
+            self.info_text.insert(tk.END, "Nenhum item rastreado.")
+        
+        # Configurar tags para cores
+        self.info_text.tag_configure("warning", foreground="#FF5555")
+        self.info_text.tag_configure("normal", foreground=self.config.get("overlay.text_color", "#FFFFFF"))
+        
+        # Desabilitar edição
+        self.info_text.configure(state=tk.DISABLED)
+        
+        # Atualizar minimapa se estiver habilitado
+        if self.minimap_panel and self.config.get("minimap.enabled", True):
+            self.minimap_panel.update_minimap(self.screen_width, self.screen_height)
+        
+        # Agendar próxima atualização
+        update_interval = self.config.get("overlay_update_interval_ms", 500)
+        self.root.after(update_interval, self.update_display)
+    
+    def update_screen_size(self, width: int, height: int) -> None:
+        """
+        Atualiza o tamanho da tela do jogo.
+        
+        Args:
+            width: Largura da tela do jogo
+            height: Altura da tela do jogo
+        """
+        self.screen_width = width
+        self.screen_height = height
+    
+    def start(self) -> None:
+        """Inicia o loop principal da interface gráfica."""
+        # Iniciar a atualização do display
+        self.update_display()
+        
+        # Iniciar o loop principal
+        self.root.mainloop()
+    
+    def save_position(self) -> None:
+        """Salva a posição atual da janela nas configurações."""
+        if self.root:
+            overlay_config = self.config.get("overlay", {})
+            overlay_config["position_x"] = self.root.winfo_x()
+            overlay_config["position_y"] = self.root.winfo_y()
+            overlay_config["width"] = self.root.winfo_width()
+            overlay_config["height"] = self.root.winfo_height()
+            self.config.set("overlay", overlay_config)
+            self.config.save_config()
+
+
+class FogDetector:
+    """Classe principal que coordena todas as funcionalidades do detector."""
+    
+    def __init__(self, config_file: str = "fog_detector_config.json"):
+        """Inicializa o detector de fog."""
+        self.config_manager = ConfigManager(config_file)
+        self.yolo_detector = YOLODetector(self.config_manager)
+        self.screen_capture = ScreenCapture(self.config_manager)
+        self.item_tracker = ItemTracker(self.config_manager)
+        self.overlay = None
+        self.running = False
+        self.detection_thread = None
+    
+    def _detection_loop(self) -> None:
+        """Loop principal de detecção executado em uma thread separada."""
+        detection_interval = self.config_manager.get("detection_interval_ms", 1500) / 1000.0
+        
+        while self.running:
+            try:
+                self._detect_items()
+                time.sleep(detection_interval)
+            except Exception as e:
+                logger.error(f"Erro no loop de detecção: {e}")
+                time.sleep(1)  # Esperar um pouco antes de tentar novamente
+    
+    def _detect_items(self) -> None:
+        """Detecta itens na tela do jogo."""
+        # Capturar a tela
+        capture_result = self.screen_capture.capture()
+        if not capture_result:
+            return
+        
+        frame, _, _, width, height = capture_result
+        
+        # Atualizar tamanho da tela no overlay
+        if self.overlay:
+            self.overlay.update_screen_size(width, height)
+        
+        # Detectar objetos
+        detections = self.yolo_detector.detect(frame)
+        
+        # Filtrar apenas itens rastreáveis
+        item_durations = self.config_manager.get("item_durations", {})
+        filtered_detections = [
+            d for d in detections if d['name'] in item_durations
+        ]
+        
+        # Processar detecções
+        self.item_tracker.process_detections(filtered_detections, (width, height))
+        
+        # Debug: salvar frame com detecções
+        if self.config_manager.get("debug_mode", False):
+            debug_frame = frame.copy()
+            for detection in filtered_detections:
+                x, y = detection['x'], detection['y']
+                w, h = detection['width'], detection['height']
+                cv2.rectangle(debug_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                cv2.putText(
+                    debug_frame, 
+                    f"{detection['name']} {detection['confidence']:.2f}", 
+                    (x, y - 10), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 
+                    0.5, 
+                    (0, 255, 0), 
+                    2
+                )
+            
+            # Salvar frame com timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            debug_dir = "debug_frames"
+            os.makedirs(debug_dir, exist_ok=True)
+            cv2.imwrite(f"{debug_dir}/detection_{timestamp}.jpg", debug_frame)
+    
+    def start(self) -> None:
+        """Inicia o detector de fog."""
+        if self.running:
+            logger.warning("Detector já está em execução")
+            return
+        
+        logger.info("Iniciando Dota 2 Fog Detector")
+        
+        # Iniciar thread de detecção
+        self.running = True
+        self.detection_thread = threading.Thread(target=self._detection_loop)
+        self.detection_thread.daemon = True
+        self.detection_thread.start()
+        
+        # Iniciar interface gráfica
+        self.overlay = OverlayGUI(self.config_manager, self.item_tracker)
+        
+        try:
+            # Iniciar loop principal da interface
+            self.overlay.start()
+        except Exception as e:
+            logger.error(f"Erro na interface gráfica: {e}")
+        finally:
+            # Salvar configurações ao sair
+            if self.overlay:
+                self.overlay.save_position()
+            
+            # Parar thread de detecção
+            self.stop()
+    
+    def stop(self) -> None:
+        """Para o detector de fog."""
+        logger.info("Parando Dota 2 Fog Detector")
+        self.running = False
+        
+        if self.detection_thread and self.detection_thread.is_alive():
+            self.detection_thread.join(timeout=2.0)
+        
+        # Salvar configurações
+        self.config_manager.save_config()
+
+
+def main():
+    """Função principal."""
+    # Configurar argumentos de linha de comando
+    import argparse
+    parser = argparse.ArgumentParser(description="Dota 2 Fog Detector")
+    parser.add_argument("--config", type=str, default="fog_detector_config.json",
+                        help="Caminho para o arquivo de configuração")
+    parser.add_argument("--debug", action="store_true",
+                        help="Ativar modo de depuração")
+    args = parser.parse_args()
+    
+    # Criar e iniciar o detector
+    detector = FogDetector(config_file=args.config)
+    
+    # Ativar modo de depuração se solicitado
+    if args.debug:
+        detector.config_manager.set("debug_mode", True)
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.debug("Modo de depuração ativado")
+    
+    try:
+        detector.start()
+    except KeyboardInterrupt:
+        logger.info("Detector interrompido pelo usuário")
+    except Exception as e:
+        logger.error(f"Erro ao executar o detector: {e}")
+    finally:
+        detector.stop()
+
+
+if __name__ == "__main__":
+    main()
